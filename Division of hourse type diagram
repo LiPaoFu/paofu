@@ -1,0 +1,287 @@
+# 1.安装必要库
+
+!pip install segmentation-models-pytorch albumentations opencv-python matplotlib numpy pandas xmltodict
+
+
+# 2.数据预处理
+
+import cv2
+import numpy as np
+import xml.etree.ElementTree as ET
+from sklearn.model_selection import train_test_split
+import os
+
+# 创建数据集目录结构
+!mkdir - p / content / dataset / images / content / dataset / masks  # 修改 mkdir 命令
+!mkdir - p / content / splits
+
+
+# SVG转Mask函数（关键步骤）
+def svg_to_mask(svg_path, img_size=(1479, 1486)):
+    """
+    将SVG标注文件转换为分割掩码
+    参数：
+        svg_path: SVG文件路径
+        img_size: 输出掩码尺寸 (width, height)
+    返回：
+        numpy.ndarray: 生成的掩码图像
+    """
+    # 初始化空白掩码
+    mask = np.zeros((img_size[1], img_size[0]), dtype=np.uint8)
+
+    # 定义类别映射（根据您的SVG文件调整）
+    CLASS_COLORS = {
+        "Wall": 1,
+        "Door": 2,
+        "Window": 3,
+        "Room": 4,
+        "Parking": 5,
+        "Separation": 6
+    }
+
+    try:
+        tree = ET.parse(svg_path)
+        root = tree.getroot()
+
+        # 处理所有多边形标注
+        for polygon in root.findall(".//polygon"):
+            class_name = polygon.get("class").split("-")[0]  # 处理"Door-1"这类标签
+            if class_name not in CLASS_COLORS:
+                continue
+
+            # 解析多边形坐标点
+            points = []
+            for pt in polygon.get("points").strip().split():
+                x, y = map(float, pt.split(','))
+                points.append([x, y])
+
+            # 绘制多边形
+            pts = np.array(points, np.int32)
+            cv2.fillPoly(mask, [pts], CLASS_COLORS[class_name])
+
+    except Exception as e:
+        print(f"Error processing {svg_path}: {str(e)}")
+
+    return mask
+
+
+# 示例转换（假设文件已上传）
+# 批量处理函数
+def process_dataset(data_dir, output_dir):
+    """ 批量处理整个数据集 """
+    for filename in os.listdir(data_dir):
+        if filename.endswith(".svg"):
+            # 提取基本名称，例如从 "5_gt_9.svg" 中提取 "5"
+            base_name = filename.split('_gt_')[0]
+
+            # 构造SVG文件路径和图像文件路径
+            svg_path = os.path.join(data_dir, filename)
+            image_path = os.path.join(data_dir, base_name + ".png")
+
+            # 生成掩码并保存
+            mask = svg_to_mask(svg_path)
+            cv2.imwrite(f"{output_dir}/masks/{base_name}.png", mask)
+
+            # 复制对应的PNG图像，并检查是否读取成功
+            img = cv2.imread(image_path)
+            if img is not None:  # 检查图像是否读取成功
+                cv2.imwrite(f"{output_dir}/images/{base_name}.png", img)
+            else:
+                print(f"Error reading image: {image_path}")
+
+
+# 执行处理，指定数据目录和输出目录
+process_dataset("/content/sample_data/ImagesGT", "/content/dataset")
+
+
+
+# 3.创建PyTorch数据集
+
+
+import torch
+from torch.utils.data import Dataset, DataLoader
+import albumentations as A
+import cv2
+import numpy as np
+import xml.etree.ElementTree as ET
+from sklearn.model_selection import train_test_split
+import os
+
+
+class FloorPlanDataset(Dataset):
+    def __init__(self, image_dir, mask_dir, transform=None):
+        self.image_dir = image_dir
+        self.mask_dir = mask_dir
+        self.transform = transform
+        self.images = os.listdir(image_dir)
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        img_path = os.path.join(self.image_dir, self.images[idx])
+        mask_path = os.path.join(self.mask_dir, self.images[idx])
+
+        image = cv2.imread(img_path)
+        image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+        mask = cv2.imread(mask_path, cv2.IMREAD_GRAYSCALE)
+
+        # 确保图像和掩码的尺寸一致
+        image = cv2.resize(image, (512, 512))
+        mask = cv2.resize(mask, (512, 512))
+
+        if self.transform:
+            augmented = self.transform(image=image, mask=mask)
+            image = augmented["image"]
+            mask = augmented["mask"]
+
+        image = image.transpose(2, 0, 1).astype('float32') / 255.0
+        return torch.tensor(image), torch.tensor(mask, dtype=torch.long)
+
+
+# 数据增强配置
+train_transform = A.Compose([
+    A.Resize(512, 512),  # 确保图像和掩码都调整为 512x512
+    A.HorizontalFlip(p=0.5),
+    A.RandomBrightnessContrast(p=0.2),
+    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+], is_check_shapes=False)  # 禁用形状检查，但请谨慎使用
+
+val_transform = A.Compose([
+    A.Resize(512, 512),  # 确保图像和掩码都调整为 512x512
+    A.Normalize(mean=(0.485, 0.456, 0.406), std=(0.229, 0.224, 0.225))
+], is_check_shapes=False)  # 禁用形状检查，但请谨慎使用
+
+# 划分数据集
+image_dir = "/content/dataset/images"
+mask_dir = "/content/dataset/masks"
+all_files = os.listdir(image_dir)
+train_files, val_files = train_test_split(all_files, test_size=0.2, random_state=42)
+
+# 创建数据集实例
+train_dataset = FloorPlanDataset(
+    image_dir=image_dir,
+    mask_dir=mask_dir,
+    transform=train_transform
+)
+val_dataset = FloorPlanDataset(
+    image_dir=image_dir,
+    mask_dir=mask_dir,
+    transform=val_transform
+)
+
+# 创建数据加载器
+BATCH_SIZE = 4
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+val_loader = DataLoader(val_dataset, batch_size=BATCH_SIZE)
+
+
+# 4.Unet模型定义与训练
+
+
+import segmentation_models_pytorch as smp
+import torch.nn as nn
+
+# 模型配置
+model = smp.Unet(
+    encoder_name="resnet34",
+    encoder_weights="imagenet",
+    classes=7,  # 根据您的类别数调整
+    activation=None
+)
+
+# 损失函数和优化器
+criterion = smp.losses.DiceLoss(mode='multiclass')
+optimizer = torch.optim.Adam(model.parameters(), lr=1e-4)
+device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+model.to(device)
+
+
+# 训练函数
+def train_epoch(model, loader, criterion, optimizer, device):
+    model.train()
+    total_loss = 0.0
+
+    for images, masks in loader:
+        images = images.to(device)
+        masks = masks.to(device)
+
+        optimizer.zero_grad()
+        outputs = model(images)
+        loss = criterion(outputs, masks)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += loss.item()
+
+    return total_loss / len(loader)
+
+
+# 验证函数
+def validate(model, loader, criterion, device):
+    model.eval()
+    val_loss = 0.0
+
+    with torch.no_grad():
+        for images, masks in loader:
+            images = images.to(device)
+            masks = masks.to(device)
+
+            outputs = model(images)
+            loss = criterion(outputs, masks)
+            val_loss += loss.item()
+
+    return val_loss / len(loader)
+
+# 训练循环
+NUM_EPOCHS = 10
+for epoch in range(NUM_EPOCHS):
+    train_loss = train_epoch(model, train_loader, criterion, optimizer, device)
+    val_loss = validate(model, val_loader, criterion, device)
+
+    print(f"Epoch {epoch + 1}/{NUM_EPOCHS}")
+    print(f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f}")
+
+    
+
+# 5.可视化与评估
+
+
+import matplotlib.pyplot as plt
+
+
+    # 可视化函数
+    def visualize_sample(model, dataset, device, n_samples=3):
+        model.eval()
+        indices = np.random.choice(len(dataset), n_samples)
+
+        plt.figure(figsize=(15, 5 * n_samples))
+        for i, idx in enumerate(indices):
+            image, mask = dataset[idx]
+
+            with torch.no_grad():
+                pred = model(image.unsqueeze(0).to(device))
+                pred_mask = pred.argmax(1).squeeze().cpu().numpy()
+
+            # 显示结果
+            plt.subplot(n_samples, 3, i * 3 + 1)
+            plt.imshow(image.permute(1, 2, 0).numpy())
+            plt.title("Original Image")
+
+            plt.subplot(n_samples, 3, i * 3 + 2)
+            plt.imshow(mask.numpy(), cmap="jet")
+            plt.title("Ground Truth")
+
+            plt.subplot(n_samples, 3, i * 3 + 3)
+            plt.imshow(pred_mask, cmap="jet")
+            plt.title("Prediction")
+
+        plt.tight_layout()
+        plt.show()
+
+
+    # 执行可视化
+    visualize_sample(model, val_dataset, device)
+
+    # 保存模型
+    torch.save(model.state_dict(), "floorplan_unet.pth")
